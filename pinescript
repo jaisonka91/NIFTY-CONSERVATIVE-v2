@@ -1,0 +1,366 @@
+//@version=6
+indicator("NIFTY CONSERVATIVE v2", overlay=true, max_labels_count=500)
+
+// ============================================================================
+// CONSERVATIVE NIFTY INTRADAY STRATEGY
+// Core: EMA 9/21 crossover
+// Filter 1: Supertrend must agree with direction (trend filter)
+// Filter 2: RSI must be in momentum zone (not overbought/oversold)
+// Filter 3: EMA 50 as higher timeframe trend bias
+// Filter 4: Minimum candle body size (avoid doji/indecision)
+// SL/TP: Tighter SL, wider TP for better R:R (1:2.5)
+// ============================================================================
+
+// ======================== INPUTS ========================
+grp1 = "EMA Settings"
+lenF = input.int(9, "Fast EMA", group=grp1)
+lenS = input.int(21, "Slow EMA", group=grp1)
+lenBias = input.int(50, "Trend Bias EMA", group=grp1)
+
+grp2 = "Supertrend Filter"
+stLen = input.int(10, "Supertrend ATR Length", group=grp2)
+stMult = input.float(2.0, "Supertrend Multiplier", step=0.1, group=grp2)
+
+grp3 = "RSI Filter"
+rsiLen = input.int(14, "RSI Length", group=grp3)
+rsiLongMin = input.int(55, "RSI Min for Long", group=grp3)
+rsiLongMax = input.int(68, "RSI Max for Long", group=grp3)
+rsiShortMin = input.int(32, "RSI Min for Short", group=grp3)
+rsiShortMax = input.int(45, "RSI Max for Short", group=grp3)
+
+grp4 = "Risk Management"
+slPts = input.float(45.0, "SL Points", step=5, group=grp4)
+tpPts = input.float(90.0, "TP Points", step=5, group=grp4)
+useTrailSL = input.bool(true, "Enable Trailing SL", group=grp4)
+trailPts = input.float(60.0, "Trail Activate After (pts)", step=5, group=grp4)
+trailOffset = input.float(30.0, "Trail Offset (pts)", step=5, group=grp4)
+
+grp5 = "Candle Filter"
+minBody = input.float(10.0, "Min Candle Body (pts)", step=1, group=grp5)
+
+grp6 = "Time Filter"
+useTime = input.bool(true, "Enable Time Filter", group=grp6)
+
+grp7 = "Option Settings"
+strikeGap = input.int(50, "Nifty Strike Gap", group=grp7, tooltip="Nifty strikes are 50 pts apart")
+optionType = input.string("ATM", "Strike Selection", options=["ATM", "ITM1", "OTM1"], group=grp7)
+lotQty = input.int(65, "Lot Size (qty)", group=grp7)
+premiumSL = input.float(0.30, "Option SL (% of premium)", step=0.05, group=grp7, tooltip="Exit if option premium drops 30%")
+premiumTP = input.float(0.50, "Option TP (% of premium)", step=0.05, group=grp7, tooltip="Exit if option premium gains 50%")
+
+// ======================== CALCULATIONS ========================
+// EMAs
+emaF = ta.ema(close, lenF)
+emaS = ta.ema(close, lenS)
+emaBias = ta.ema(close, lenBias)
+
+// Supertrend
+[stVal, stDir] = ta.supertrend(stMult, stLen)
+stBull = stDir < 0
+stBear = stDir > 0
+
+// RSI
+rsi = ta.rsi(close, rsiLen)
+
+// Candle body
+body = math.abs(close - open)
+
+// Time filter (IST)
+istH = hour(time, "Asia/Kolkata")
+istM = minute(time, "Asia/Kolkata")
+istTime = istH * 100 + istM
+inEntry = useTime ? (istTime >= 1000 and istTime <= 1330) : true
+isSqOff = useTime ? (istTime >= 1520) : false
+
+// 1 TRADE PER DAY
+thisDay = dayofmonth(time, "Asia/Kolkata")
+thisMonth = month(time, "Asia/Kolkata")
+var int lastDay = -1
+var int lastMonth = -1
+tradedToday = (lastDay == thisDay and lastMonth == thisMonth)
+
+// ======================== ENTRY CONDITIONS ========================
+emaCross_bull = ta.crossover(emaF, emaS)
+emaCross_bear = ta.crossunder(emaF, emaS)
+
+// LONG: EMA cross up + above EMA50 + Supertrend green + RSI 50-70 + decent candle
+longSignal = emaCross_bull and close > emaBias and stBull and rsi > rsiLongMin and rsi < rsiLongMax and body > minBody and inEntry and not tradedToday
+
+// SHORT: EMA cross down + below EMA50 + Supertrend red + RSI 32-45 + decent candle
+shortSignal = emaCross_bear and close < emaBias and stBear and rsi > rsiShortMin and rsi < rsiShortMax and body > minBody and inEntry and not tradedToday
+
+// ======================== POSITION TRACKING ========================
+var int pos = 0
+var float entryPrice = 0.0
+var float trailSL = 0.0
+var float totalPnL = 0.0
+var int wins = 0
+var int losses = 0
+var int totalTrades = 0
+var float maxPnL = 0.0
+var float maxDD = 0.0
+var float peakPnL = 0.0
+
+var float exitPrice = 0.0
+var float tradePnL = 0.0
+closed = false
+
+// ======================== EXIT LOGIC ========================
+
+// Close long
+if pos == 1
+    float unrealPnL = close - entryPrice
+    // Trailing SL update
+    if useTrailSL and unrealPnL >= trailPts
+        float newTrail = close - trailOffset
+        if newTrail > trailSL
+            trailSL := newTrail
+    // Check SL (use trail if active, otherwise fixed)
+    float activeSL = (useTrailSL and trailSL > entryPrice - slPts) ? trailSL : entryPrice - slPts
+    if low <= activeSL
+        exitPrice := activeSL
+        tradePnL := exitPrice - entryPrice
+        totalPnL += tradePnL
+        totalTrades += 1
+        if tradePnL > 0
+            wins += 1
+        else
+            losses += 1
+        pos := 0
+        closed := true
+    // Check TP
+    else if high >= entryPrice + tpPts
+        exitPrice := entryPrice + tpPts
+        tradePnL := tpPts
+        totalPnL += tradePnL
+        totalTrades += 1
+        wins += 1
+        pos := 0
+        closed := true
+    // Opposite signal exit
+    else if shortSignal
+        exitPrice := close
+        tradePnL := close - entryPrice
+        totalPnL += tradePnL
+        totalTrades += 1
+        if tradePnL > 0
+            wins += 1
+        else
+            losses += 1
+        pos := 0
+        closed := true
+
+// Close short
+if pos == -1
+    float unrealPnL = entryPrice - close
+    // Trailing SL update
+    if useTrailSL and unrealPnL >= trailPts
+        float newTrail = close + trailOffset
+        if newTrail < trailSL or trailSL == 0
+            trailSL := newTrail
+    // Check SL
+    float activeSL = (useTrailSL and trailSL > 0 and trailSL < entryPrice + slPts) ? trailSL : entryPrice + slPts
+    if high >= activeSL
+        exitPrice := activeSL
+        tradePnL := entryPrice - exitPrice
+        totalPnL += tradePnL
+        totalTrades += 1
+        if tradePnL > 0
+            wins += 1
+        else
+            losses += 1
+        pos := 0
+        closed := true
+    // Check TP
+    else if low <= entryPrice - tpPts
+        exitPrice := entryPrice - tpPts
+        tradePnL := tpPts
+        totalPnL += tradePnL
+        totalTrades += 1
+        wins += 1
+        pos := 0
+        closed := true
+    // Opposite signal exit
+    else if longSignal
+        exitPrice := close
+        tradePnL := entryPrice - close
+        totalPnL += tradePnL
+        totalTrades += 1
+        if tradePnL > 0
+            wins += 1
+        else
+            losses += 1
+        pos := 0
+        closed := true
+
+// EOD square off
+if isSqOff and pos != 0 and not closed
+    exitPrice := close
+    tradePnL := pos == 1 ? (close - entryPrice) : (entryPrice - close)
+    totalPnL += tradePnL
+    totalTrades += 1
+    if tradePnL > 0
+        wins += 1
+    else
+        losses += 1
+    pos := 0
+    closed := true
+
+// ======================== ENTRY ========================
+if longSignal and pos == 0
+    pos := 1
+    entryPrice := close
+    trailSL := close - slPts
+    lastDay := thisDay
+    lastMonth := thisMonth
+
+if shortSignal and pos == 0
+    pos := -1
+    entryPrice := close
+    trailSL := close + slPts
+    lastDay := thisDay
+    lastMonth := thisMonth
+
+// ======================== DRAWDOWN TRACKING ========================
+if totalPnL > peakPnL
+    peakPnL := totalPnL
+dd = peakPnL - totalPnL
+if dd > maxDD
+    maxDD := dd
+
+// ======================== PLOTS ========================
+plot(emaF, "EMA 9", color.aqua, 2)
+plot(emaS, "EMA 21", color.orange, 2)
+plot(emaBias, "EMA 50", color.new(color.white, 40), 1, plot.style_cross)
+
+// Supertrend
+plot(stVal, "Supertrend", stBull ? color.new(color.green, 30) : color.new(color.red, 30), 2, plot.style_stepline_diamond)
+
+// OPTION STRIKE CALC (needed before labels)
+atmStrike = math.round(close / strikeGap) * strikeGap
+itm1CE = atmStrike - strikeGap
+itm1PE = atmStrike + strikeGap
+otm1CE = atmStrike + strikeGap
+otm1PE = atmStrike - strikeGap
+ceStrike = optionType == "ATM" ? atmStrike : optionType == "ITM1" ? itm1CE : otm1CE
+peStrike = optionType == "ATM" ? atmStrike : optionType == "ITM1" ? itm1PE : otm1PE
+
+// Entry labels with option recommendation
+if longSignal and pos == 1
+    lTxt = "BUY " + str.tostring(ceStrike, "#") + " CE @" + str.tostring(close, "#.0")
+    label.new(bar_index, low, lTxt, color=color.green, textcolor=color.white, style=label.style_label_up, size=size.small)
+
+if shortSignal and pos == -1
+    sTxt = "BUY " + str.tostring(peStrike, "#") + " PE @" + str.tostring(close, "#.0")
+    label.new(bar_index, high, sTxt, color=color.red, textcolor=color.white, style=label.style_label_down, size=size.small)
+
+// Exit labels
+if closed
+    lblColor = tradePnL > 0 ? color.lime : color.maroon
+    lblText = tradePnL > 0 ? "+" + str.tostring(tradePnL, "#.0") : str.tostring(tradePnL, "#.0")
+    label.new(bar_index, tradePnL > 0 ? high : low, lblText, color=lblColor, textcolor=color.white, style=tradePnL > 0 ? label.style_label_down : label.style_label_up, size=size.tiny)
+
+// Position background
+bgcolor(pos == 1 ? color.new(color.green, 94) : pos == -1 ? color.new(color.red, 94) : na)
+
+// Active SL/TP lines
+plot(pos == 1 ? entryPrice + tpPts : na, "TP", color.new(color.lime, 40), 1, plot.style_linebr)
+plot(pos == 1 ? (useTrailSL and trailSL > entryPrice - slPts ? trailSL : entryPrice - slPts) : na, "SL", color.new(color.red, 40), 1, plot.style_linebr)
+plot(pos == -1 ? entryPrice - tpPts : na, "TP", color.new(color.lime, 40), 1, plot.style_linebr)
+plot(pos == -1 ? (useTrailSL and trailSL > 0 and trailSL < entryPrice + slPts ? trailSL : entryPrice + slPts) : na, "SL", color.new(color.red, 40), 1, plot.style_linebr)
+
+// Entry window bg
+bgcolor(useTime and inEntry ? color.new(color.blue, 97) : na)
+
+// ======================== CAPITAL TRACKING ========================
+capital = 15000.0
+lotSize = 65.0
+pnlRs = totalPnL * lotSize
+capitalNow = capital + pnlRs
+capitalPct = (pnlRs / capital) * 100
+
+// ======================== RESULTS DASHBOARD ========================
+winRate = totalTrades > 0 ? (wins / totalTrades) * 100 : 0.0
+avgPnL = totalTrades > 0 ? totalPnL / totalTrades : 0.0
+expectancy = totalTrades > 0 ? (winRate/100 * tpPts) - ((100 - winRate)/100 * slPts) : 0.0
+
+var table dash = table.new(position.top_right, 2, 16, bgcolor=color.new(#0d1117, 10), border_width=1, border_color=color.new(color.gray, 60))
+
+if barstate.islast
+    table.cell(dash, 0, 0, "NIFTY CONSERVATIVE", text_color=color.aqua, text_size=size.normal)
+    table.cell(dash, 1, 0, "BACKTEST", text_color=color.yellow, text_size=size.normal)
+
+    table.cell(dash, 0, 1, "Capital", text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 1, "Rs 15,000", text_color=color.white, text_size=size.small)
+
+    table.cell(dash, 0, 2, "Current Value", text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 2, "Rs " + str.tostring(capitalNow, "#.0"), text_color=capitalNow >= capital ? color.green : color.red, text_size=size.small)
+
+    table.cell(dash, 0, 3, "P&L (Rs)", text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 3, "Rs " + str.tostring(pnlRs, "#.0"), text_color=pnlRs >= 0 ? color.green : color.red, text_size=size.small)
+
+    table.cell(dash, 0, 4, "Return %", text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 4, str.tostring(capitalPct, "#.1") + "%", text_color=capitalPct >= 0 ? color.green : color.red, text_size=size.small)
+
+    table.cell(dash, 0, 5, "--------", text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 5, "--------", text_color=color.gray, text_size=size.small)
+
+    table.cell(dash, 0, 6, "Total Trades", text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 6, str.tostring(totalTrades), text_color=color.white, text_size=size.small)
+
+    table.cell(dash, 0, 7, "Wins", text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 7, str.tostring(wins), text_color=color.green, text_size=size.small)
+
+    table.cell(dash, 0, 8, "Losses", text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 8, str.tostring(losses), text_color=color.red, text_size=size.small)
+
+    table.cell(dash, 0, 9, "Win Rate", text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 9, str.tostring(winRate, "#.1") + "%", text_color=winRate >= 50 ? color.green : color.red, text_size=size.small)
+
+    table.cell(dash, 0, 10, "Total P&L (pts)", text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 10, str.tostring(totalPnL, "#.0") + " pts", text_color=totalPnL >= 0 ? color.green : color.red, text_size=size.small)
+
+    table.cell(dash, 0, 11, "Avg P&L/Trade", text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 11, str.tostring(avgPnL, "#.1") + " pts", text_color=avgPnL >= 0 ? color.green : color.red, text_size=size.small)
+
+    table.cell(dash, 0, 12, "Max Drawdown", text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 12, str.tostring(maxDD, "#.0") + " pts", text_color=color.orange, text_size=size.small)
+
+    table.cell(dash, 0, 13, "Expectancy", text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 13, str.tostring(expectancy, "#.1") + " pts", text_color=expectancy >= 0 ? color.green : color.red, text_size=size.small)
+
+    table.cell(dash, 0, 14, "SL/TP | R:R", text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 14, str.tostring(slPts, "#.0") + "/" + str.tostring(tpPts, "#.0") + " | 1:" + str.tostring(tpPts/slPts, "#.1"), text_color=color.orange, text_size=size.small)
+
+    table.cell(dash, 0, 15, "Today", text_color=color.silver, text_size=size.small)
+    tradeStatus = pos == 1 ? "LONG" : pos == -1 ? "SHORT" : tradedToday ? "DONE" : "WAITING"
+    tradeCol = pos == 1 ? color.green : pos == -1 ? color.red : tradedToday ? color.orange : color.gray
+    table.cell(dash, 1, 15, tradeStatus, text_color=tradeCol, text_size=size.small)
+
+// OPTION RECOMMENDATION TABLE
+var table optTbl = table.new(position.bottom_right, 2, 8, bgcolor=color.new(#0d1117, 10), border_width=1, border_color=color.new(color.gray, 60))
+
+if barstate.islast
+    table.cell(optTbl, 0, 0, "OPTION GUIDE", text_color=color.yellow, text_size=size.normal)
+    table.cell(optTbl, 1, 0, optionType, text_color=color.aqua, text_size=size.normal)
+
+    table.cell(optTbl, 0, 1, "Nifty Spot", text_color=color.silver, text_size=size.small)
+    table.cell(optTbl, 1, 1, str.tostring(close, "#.0"), text_color=color.white, text_size=size.small)
+
+    table.cell(optTbl, 0, 2, "ATM Strike", text_color=color.silver, text_size=size.small)
+    table.cell(optTbl, 1, 2, str.tostring(atmStrike, "#"), text_color=color.yellow, text_size=size.small)
+
+    table.cell(optTbl, 0, 3, "BUY CE Strike", text_color=color.silver, text_size=size.small)
+    table.cell(optTbl, 1, 3, str.tostring(ceStrike, "#") + " CE", text_color=color.green, text_size=size.small)
+
+    table.cell(optTbl, 0, 4, "BUY PE Strike", text_color=color.silver, text_size=size.small)
+    table.cell(optTbl, 1, 4, str.tostring(peStrike, "#") + " PE", text_color=color.red, text_size=size.small)
+
+    table.cell(optTbl, 0, 5, "Lot Size", text_color=color.silver, text_size=size.small)
+    table.cell(optTbl, 1, 5, str.tostring(lotQty) + " qty", text_color=color.white, text_size=size.small)
+
+    table.cell(optTbl, 0, 6, "Option SL", text_color=color.silver, text_size=size.small)
+    table.cell(optTbl, 1, 6, str.tostring(premiumSL * 100, "#") + "% of premium", text_color=color.red, text_size=size.small)
+
+    table.cell(optTbl, 0, 7, "Option TP", text_color=color.silver, text_size=size.small)
+    table.cell(optTbl, 1, 7, str.tostring(premiumTP * 100, "#") + "% of premium", text_color=color.green, text_size=size.small)
